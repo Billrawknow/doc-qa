@@ -20,8 +20,10 @@ import argparse
 import logging
 import math
 import os
+import random
 import re
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,6 +35,10 @@ HERE = Path(__file__).resolve().parent
 load_dotenv(HERE / ".env")
 
 logging.getLogger("pypdf").setLevel(logging.ERROR)   # we report broken PDFs ourselves, in plain English
+log = logging.getLogger("doc_qa")
+log.addHandler(logging.NullHandler())   # imported as a library: never print tracebacks at the user
+log.propagate = False
+ERROR_LOG = HERE / "errors.log"
 
 MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-5-5").strip()
 # Haiku 5.5 thinks by default; for short factual answers that only costs tokens.
@@ -46,10 +52,41 @@ WHOLE_DOC_CHARS = int(os.getenv("WHOLE_DOC_CHARS", "15000"))  # shorter docs (~4
 MAX_ANSWER_TOKENS = 800
 FOLLOW_UP_EXTRA = 3      # passages carried over from the previous question for follow-ups
 HISTORY_TURNS = 3        # earlier Q&A kept so follow-ups like "and the deposit?" make sense
+MAX_QUESTION_CHARS = 2000  # about a page; longer "questions" are usually a paste by mistake
+API_TIMEOUT = 30         # seconds before a hung request is abandoned (and retried)
+MAX_ATTEMPTS = 3         # per question, for rate limits, overload, network trouble
+BACKOFF_BASE = 2         # seconds: waits 2s, 4s (+ jitter) unless the API says how long
 
 
 class DocError(Exception):
     """A problem the user can fix: missing file, scanned PDF, missing API key..."""
+
+
+def setup_error_log(path=ERROR_LOG):
+    """errors.log: timestamp | level | what failed, with the input that caused it."""
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    handler.setLevel(logging.WARNING)
+    log.addHandler(handler)
+    log.setLevel(logging.WARNING)
+
+
+CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def clean_text(text):
+    """Remove control characters (pasted from PDFs/terminals) that break Word files and prompts."""
+    return CONTROL_CHARS.sub(" ", str(text))
+
+
+def clean_question(question):
+    question = re.sub(r"[ \t]+", " ", clean_text(question or "")).strip()
+    if not question:
+        raise DocError("No question provided. Please type a question first.")
+    if len(question) > MAX_QUESTION_CHARS:
+        raise DocError(f"That question is {len(question):,} characters long. Please keep it under "
+                       f"{MAX_QUESTION_CHARS:,} (about a page). To search for a passage, use /search.")
+    return question
 
 
 @dataclass
@@ -252,7 +289,15 @@ Rules:
 - Quote figures, dates, percentages and names exactly as written.
 - If the excerpts don't contain the answer, say: "The document doesn't say." and, if useful, what
   related information it does contain. Never guess.
-- Keep it short: a direct answer first, then supporting points. Plain language, no legal jargon."""
+- Keep it short: a direct answer first, then supporting points. Plain language, no legal jargon.
+- Answer in the same language as the question (e.g. Swahili in, Swahili out). Keep quoted figures
+  and clause wording as written in the document."""
+
+KEYWORDS_PROMPT = """Turn this question into English search keywords for finding the answer in a business
+document (contract, invoice, report). Translate if it isn't English. Include likely synonyms used in
+contracts. Reply with at most 12 keywords, on one line, no explanation.
+
+Question: {question}"""
 
 
 class DocumentQA:
@@ -267,6 +312,7 @@ class DocumentQA:
         self.history = []        # [(question, answer)]
         self.log = []            # [(question, answer, pages_used, tokens_in, tokens_out)]
         self.cost = 0.0
+        self.last_keywords = None   # English keywords used when the question itself matched nothing
 
     def describe(self):
         mode = ("short enough to send whole" if self.whole
@@ -284,7 +330,15 @@ class DocumentQA:
             for chunk in self.retriever.search(self.history[-1][0], k=FOLLOW_UP_EXTRA):
                 if chunk not in hits:
                     hits.append(chunk)
-        if not hits:   # no keyword overlap at all: fall back to the opening chunks
+        self.last_keywords = None
+        if not hits:
+            # Nothing matched: often a Swahili question, or wording the document never uses.
+            # Ask Claude for English search keywords (a few tokens) and search again.
+            keywords = self.english_keywords(question)
+            if keywords:
+                self.last_keywords = keywords
+                hits = self.retriever.search(keywords)
+        if not hits:   # still nothing: fall back to the opening chunks
             hits = self.chunks[:TOP_K]
         hits.sort(key=lambda c: c.id)   # keep document order so clauses read naturally
         return self.chunks_to_text(hits), sorted({c.page for c in hits})
@@ -294,10 +348,32 @@ class DocumentQA:
             return "\n\n".join(f"[p. {page}]\n{text}" for page, text in self.pages if text)
         return "\n\n".join(f"[{c.label}]\n{c.text}" for c in hits)
 
+    def english_keywords(self, question):
+        try:
+            response = self.call_claude([{"role": "user", "content": KEYWORDS_PROMPT.format(question=question)}],
+                                        max_tokens=60, system="You write search keywords.")
+        except DocError as err:
+            log.warning(f"keyword rewrite failed, using opening pages instead: {err} | input: {question[:200]!r}")
+            return ""
+        self.add_cost(response.usage)
+        text = " ".join(getattr(b, "text", "") for b in response.content).split()
+        keywords = ""
+        for word in text:                      # cap at ~200 chars without cutting a word in half
+            if len(keywords) + len(word) > 200:
+                break
+            keywords = f"{keywords} {word}".strip()
+        return keywords
+
+    def add_cost(self, usage):
+        self.cost += (usage.input_tokens * PRICE_PER_MTOK["input"]
+                      + usage.output_tokens * PRICE_PER_MTOK["output"]) / 1_000_000
+
     def ask(self, question):
-        question = question.strip()
-        if not question:
-            raise DocError("Type a question.")
+        try:
+            question = clean_question(question)
+        except DocError as err:
+            log.warning(f"{self.path.name} | rejected input: {err} | input: {preview(question)}")
+            raise
         excerpts, pages_used = self.context_for(question)
 
         messages = []
@@ -307,49 +383,78 @@ class DocumentQA:
                          f"Document: {self.path.name}\n\n<excerpts>\n{excerpts}\n</excerpts>\n\n"
                          f"Question: {question}"})
 
-        response = self.call_claude(messages)
+        try:
+            response = self.call_claude(messages)
+        except DocError as err:
+            log.error(f"{self.path.name} | {err} | input: {question[:200]!r}")
+            raise
         answer = "".join(b.text for b in response.content if getattr(b, "type", "") == "text").strip()
         if not answer:
             answer = "(No answer came back. Try asking again.)"
+            log.warning(f"{self.path.name} | empty answer (stop_reason={response.stop_reason}) | "
+                        f"input: {question[:200]!r}")
+        if response.stop_reason == "max_tokens":
+            answer += "\n\n(This answer was cut short. Ask a narrower question to get the rest.)"
+            log.warning(f"{self.path.name} | answer hit max_tokens | input: {question[:200]!r}")
         usage = response.usage
-        self.cost += (usage.input_tokens * PRICE_PER_MTOK["input"]
-                      + usage.output_tokens * PRICE_PER_MTOK["output"]) / 1_000_000
+        self.add_cost(usage)
         self.history.append((question, answer))
         self.log.append((question, answer, pages_used, usage.input_tokens, usage.output_tokens))
         return answer, pages_used, usage
 
-    def call_claude(self, messages):
+    def call_claude(self, messages, max_tokens=MAX_ANSWER_TOKENS, system=SYSTEM_PROMPT):
+        """One request with a timeout and retries (exponential backoff + jitter) for temporary errors."""
         import anthropic
         if self.client is None:
             key = os.getenv("ANTHROPIC_API_KEY", "").strip()
             if not key:
                 raise DocError("ANTHROPIC_API_KEY is missing. Copy .env.example to .env and paste your key "
                                "(or use --search, which needs no key).")
-            self.client = anthropic.Anthropic(api_key=key)
-        try:
-            return self.client.messages.create(model=MODEL, max_tokens=MAX_ANSWER_TOKENS,
-                                               system=SYSTEM_PROMPT, messages=messages, **EXTRA_ARGS)
-        except anthropic.AuthenticationError:
-            raise DocError("The API key was rejected. Check ANTHROPIC_API_KEY in .env.")
-        except anthropic.RateLimitError:
-            raise DocError("Too many requests just now. Wait a minute and ask again.")
-        except anthropic.APIConnectionError:
-            raise DocError("Couldn't reach the Claude API. Check your internet connection.")
-        except anthropic.APIStatusError as err:
-            raise DocError(f"The Claude API returned an error ({err.status_code}). Try again shortly.")
+            # max_retries=0: we retry ourselves so every attempt is logged and the user sees progress
+            self.client = anthropic.Anthropic(api_key=key, timeout=API_TIMEOUT, max_retries=0)
+        temporary = tuple(getattr(anthropic, n) for n in
+                          ("RateLimitError", "APIConnectionError", "InternalServerError", "OverloadedError")
+                          if hasattr(anthropic, n))
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                return self.client.messages.create(model=MODEL, max_tokens=max_tokens, system=system,
+                                                   messages=messages, **EXTRA_ARGS)
+            except anthropic.AuthenticationError:
+                raise DocError("The API key was rejected. Check ANTHROPIC_API_KEY in .env.")
+            except anthropic.BadRequestError as err:
+                raise DocError(f"Claude couldn't process that request ({getattr(err, 'message', err)}).")
+            except temporary as err:
+                kind = {"RateLimitError": "too many requests", "APITimeoutError": "no reply within "
+                        f"{API_TIMEOUT}s", "APIConnectionError": "no connection"}.get(type(err).__name__,
+                                                                                    "the API is busy")
+                if attempt == MAX_ATTEMPTS:
+                    raise DocError(f"Claude didn't answer after {MAX_ATTEMPTS} tries ({kind}). "
+                                   "Check your internet connection and try again in a minute.")
+                wait = retry_after(err) or BACKOFF_BASE * 2 ** (attempt - 1) + random.uniform(0, 1)
+                log.warning(f"attempt {attempt}/{MAX_ATTEMPTS} failed ({type(err).__name__}), retrying in {wait:.1f}s")
+                print(f"  ({kind}; retrying in {wait:.0f}s, attempt {attempt + 1} of {MAX_ATTEMPTS})")
+                time.sleep(wait)
+            except anthropic.APIStatusError as err:
+                raise DocError(f"The Claude API returned an error ({err.status_code}). Try again shortly.")
 
     def save_report(self, out_path):
+        try:
+            return self._save_report(out_path)
+        except PermissionError:
+            raise DocError(f"Couldn't save {Path(out_path).name}. Is it open in Word? Close it and try again.")
+
+    def _save_report(self, out_path):
         """Save the Q&A session as a Word document (python-docx)."""
         import docx
         from docx.shared import Pt, RGBColor
         report = docx.Document()
-        report.add_heading(f"Questions on {self.path.name}", 0)
+        report.add_heading(clean_text(f"Questions on {self.path.name}"), 0)
         meta = report.add_paragraph()
         meta.add_run(f"{datetime.now():%d %B %Y, %H:%M}  |  {len(self.pages)} pages  |  "
                      f"{len(self.log)} question(s)").italic = True
         for n, (question, answer, pages, _, _) in enumerate(self.log, start=1):
-            report.add_heading(f"{n}. {question}", level=1)
-            for para in answer.split("\n"):
+            report.add_heading(clean_text(f"{n}. {question}"), level=1)
+            for para in clean_text(answer).split("\n"):
                 if para.strip():
                     report.add_paragraph(para.strip().lstrip("-* ").strip(),
                                          style="List Bullet" if para.strip()[:1] in "-*" else None)
@@ -375,8 +480,25 @@ def print_search(qa, query):
         print(f"\n  [{c.label}]\n  " + snippet.replace("\n", "\n  "))
 
 
+def preview(text, n=200):
+    """repr() of the first n characters, with the full length if longer: safe for logs and screens."""
+    text = "" if text is None else str(text)
+    return repr(text[:n]) + (f"... ({len(text):,} chars)" if len(text) > n else "")
+
+
+def retry_after(err):
+    """Seconds the API asked us to wait (Retry-After header), if any, capped at a minute."""
+    try:
+        value = float(err.response.headers.get("retry-after"))
+        return min(max(value, 0), 60)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def answer_and_print(qa, question):
     answer, pages, usage = qa.ask(question)
+    if qa.last_keywords:
+        print(f"  (no exact match; searched for: {qa.last_keywords})")
     print(f"\n{answer}\n")
     print(f"  (pages searched: {', '.join(map(str, pages))} | "
           f"{usage.input_tokens:,} in / {usage.output_tokens:,} out tokens | "
@@ -403,11 +525,24 @@ def interactive(qa):
             print_search(qa, question[8:])
             print()
             continue
-        try:
-            answer_and_print(qa, question)
-        except DocError as err:
-            print(f"\n  Problem: {err}\n")
+        ask_safely(qa, question)
         print()
+
+
+def ask_safely(qa, question):
+    """One question can fail without ending the session (or losing the report)."""
+    try:
+        answer_and_print(qa, question)
+        return True
+    except DocError as err:
+        print(f"\n  Problem: {err}\n")
+    except KeyboardInterrupt:
+        print("\n  Cancelled. Ask another question, or /quit.\n")
+    except Exception as err:
+        log.exception(f"{qa.path.name} | unexpected {type(err).__name__}: {err} | input: {str(question)[:200]!r}")
+        print("\n  Something went wrong with that question. It's recorded in errors.log. "
+              "Try again or rephrase it.\n")
+    return False
 
 
 def main():
@@ -417,6 +552,7 @@ def main():
     p.add_argument("--search", metavar="WORDS", help="show matching passages only (no AI, no cost)")
     p.add_argument("--report", metavar="FILE.docx", help="save the questions and answers to Word")
     args = p.parse_args()
+    setup_error_log()
 
     try:
         qa = DocumentQA(args.document)
@@ -425,15 +561,23 @@ def main():
             print_search(qa, args.search)
             return
         if args.question:
+            failed = 0
             for q in args.question:
-                print(f"\nQ: {q}")
-                answer_and_print(qa, q)
+                shown = q if len(q) <= 200 else q[:200] + f"... ({len(q):,} characters)"
+                print(f"\nQ: {shown}")
+                failed += not ask_safely(qa, q)
         else:
             interactive(qa)
         if args.report and qa.log:
             print(f"\nSaved {qa.save_report(args.report)}")
+        if args.question and failed:
+            sys.exit(1)             # scripts calling this can tell that a question failed
     except DocError as err:
+        log.error(f"{args.document} | {err}")
         sys.exit(f"Problem: {err}")
+    except Exception as err:
+        log.exception(f"{args.document} | unexpected {type(err).__name__}: {err}")
+        sys.exit("Something unexpected went wrong. Details are in errors.log.")
 
 
 if __name__ == "__main__":

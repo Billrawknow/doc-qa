@@ -30,7 +30,7 @@ class FakeClient:
 
     def create(self, **kwargs):
         self.requests.append(kwargs)
-        return SimpleNamespace(content=[SimpleNamespace(type="text", text=self.answer)],
+        return SimpleNamespace(content=[SimpleNamespace(type="text", text=self.answer)], stop_reason="end_turn",
                                usage=SimpleNamespace(input_tokens=2400, output_tokens=120))
 
 
